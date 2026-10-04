@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Quick Code
+Comment=Tray menu to open project folders in VS Code or a terminal
+Exec=quick-code
+Icon=folder
+Terminal=false
+Categories=Development;Utility;
+X-GNOME-Autostart-enabled=true
