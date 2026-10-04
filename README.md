@@ -11,6 +11,17 @@ On GNOME the *AppIndicator and KStatusNotifierItem Support* extension must be en
 
 ## Install
 
+One-liner, no clone needed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tuzkituan/quick-code/main/install.sh | bash
+quick-code &
+```
+
+Uninstall: `curl -fsSL https://raw.githubusercontent.com/tuzkituan/quick-code/main/install.sh | bash -s -- --uninstall`
+
+From a clone:
+
 ```sh
 ./install.sh            # symlinks to ~/.local/bin/quick-code, adds app menu + autostart entry
 quick-code &            # start now (or log out and back in)
@@ -37,3 +48,7 @@ Or run directly without installing: `./quick_code.py [--root PATH]`.
 - `terminal: null` auto-detects ptyxis, gnome-terminal, konsole, kitty, alacritty or xterm.
 
 Restart quick-code after editing the config.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
