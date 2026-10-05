@@ -19,16 +19,17 @@ One-liner, no clone needed:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tuzkituan/quick-code/main/install.sh | bash
-quick-code &
 ```
+
+The installer starts quick-code right away and adds it to autostart, so it comes back at
+every login. Re-running it updates and restarts the running copy.
 
 Uninstall: `curl -fsSL https://raw.githubusercontent.com/tuzkituan/quick-code/main/install.sh | bash -s -- --uninstall`
 
 From a clone:
 
 ```sh
-./install.sh            # symlinks to ~/.local/bin/quick-code, adds app menu + autostart entry
-quick-code &            # start now (or log out and back in)
+./install.sh            # symlinks to ~/.local/bin/quick-code, adds app menu + autostart, starts it
 ./install.sh --uninstall
 ```
 
