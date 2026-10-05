@@ -133,26 +133,23 @@ class QuickCode:
         self.rebuild_menu()
 
     def scan(self, directory, depth, visited):
-        """Return sorted (path, children) nodes under directory. children is None for
-        a repo, else the nodes of a plain folder that has repos somewhere below it.
-        Repos are not descended into, so nested node_modules etc. are never walked."""
+        """Return every git repo under directory, at most depth levels down. Repos
+        are not descended into, so nested node_modules etc. are never walked."""
         visited.add(directory)
-        nodes = []
+        repos = []
         try:
             entries = list(directory.iterdir())
         except OSError:
-            return nodes
+            return repos
         for p in entries:
             if not p.is_dir() or (not self.show_hidden and p.name.startswith(".")):
                 continue
             # .git is a file in worktrees and submodules, hence exists() not is_dir()
             if (p / ".git").exists():
-                nodes.append((p, None))
+                repos.append(p)
             elif depth > 1:
-                children = self.scan(p, depth - 1, visited)
-                if children:
-                    nodes.append((p, children))
-        return sorted(nodes, key=lambda n: n[0].name.lower())
+                repos.extend(self.scan(p, depth - 1, visited))
+        return repos
 
     def watch(self, directories):
         for path in self.monitors.keys() - directories:
@@ -179,9 +176,9 @@ class QuickCode:
             if not root.is_dir():
                 self.add_item(menu, f"Not found: {root}", None)
                 continue
-            nodes = self.scan(root, self.max_depth, visited)
-            if nodes:
-                self.add_nodes(menu, nodes)
+            repos = self.scan(root, self.max_depth, visited)
+            if repos:
+                self.add_repos(menu, repos)
             else:
                 self.add_item(menu, f"No git repos in {display_path(root)}", None)
         self.watch(visited)
@@ -238,15 +235,17 @@ class QuickCode:
             self.config["roots"] = [display_path(r) for r in self.roots]
             save_config(self.config)
 
-    def add_nodes(self, menu, nodes):
-        for path, children in nodes:
-            item = Gtk.MenuItem(label=path.name, use_underline=False)
-            if children is None:
-                item.set_submenu(self.project_menu(str(path)))
-            else:
-                sub = Gtk.Menu()
-                self.add_nodes(sub, children)
-                item.set_submenu(sub)
+    def add_repos(self, menu, repos):
+        # One flat list: GNOME shows submenus inline, so nesting repos under their
+        # group folders made the menu change width as groups were opened.
+        names = [r.name for r in repos]
+        labelled = [
+            (f"{r.name} ({r.parent.name})" if names.count(r.name) > 1 else r.name, r)
+            for r in repos
+        ]
+        for label, repo in sorted(labelled, key=lambda lr: lr[0].lower()):
+            item = Gtk.MenuItem(label=label, use_underline=False)
+            item.set_submenu(self.project_menu(str(repo)))
             menu.append(item)
 
     def project_menu(self, directory):

@@ -1,8 +1,8 @@
 # quick-code
 
 Tray icon that lists every git repo under one or more folders (`~/projects` by default).
-Repos inside plain folders (e.g. `~/projects/group/repo`) appear under a submenu named after
-the folder; folders with no repos are hidden. Each repo has a submenu to open it in
+Repos in nested folders (e.g. `~/projects/group/repo`) are included in one flat, sorted list;
+folders that are not repos are never shown. Each repo has a submenu to open it in
 **VS Code**, a **Terminal**, or **Files**. The list updates live as repos are added or removed.
 
 Pick the folders from the tray with **Add folder…** and **Remove folder**, or list them in the
