@@ -5,6 +5,13 @@ Repos in nested folders (e.g. `~/projects/group/repo`) are included in one flat,
 folders that are not repos are never shown. Each repo has a submenu to open it in
 **VS Code**, a **Terminal**, or **Files**. The list updates live as repos are added or removed.
 
+Tray menus cannot scroll, so with more than 20 repos (`menu_limit`) the menu shows the ten
+you opened most recently plus **Search repos…**: a window where you type to filter every repo,
+then press Enter to open it in VS Code (Ctrl+T for a terminal, Ctrl+O for Files).
+
+**Pin** a repo from its submenu (or the star / Ctrl+P in the search window) to keep it at the
+top of the menu.
+
 Pick the folders from the tray with **Add folder…** and **Remove folder**, or list them in the
 config.
 
@@ -46,7 +53,8 @@ and overrides the configured folders for that run).
   "editor": ["code"],
   "terminal": null,
   "show_hidden": false,
-  "max_depth": 3
+  "max_depth": 3,
+  "menu_limit": 20
 }
 ```
 
@@ -54,6 +62,7 @@ and overrides the configured folders for that run).
   the path is appended. Example: `"terminal": ["kitty", "--directory", "{dir}"]`.
 - `roots` are the folders searched for repos. An older single `"root"` entry is still read.
 - `max_depth` is how many folder levels below each root are searched for repos.
+- `menu_limit` is how many repos the menu lists directly before switching to recent + search.
 - `terminal: null` auto-detects ptyxis, gnome-terminal, konsole, kitty, alacritty or xterm.
 
 Restart quick-code after editing the config by hand (tray changes apply immediately).

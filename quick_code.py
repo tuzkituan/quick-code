@@ -20,7 +20,7 @@ try:
 except (ValueError, ImportError):
     gi.require_version("AppIndicator3", "0.1")
     from gi.repository import AppIndicator3 as AppIndicator
-from gi.repository import Gio, GLib, Gtk
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
 try:
     gi.require_version("GLibUnix", "2.0")
@@ -32,6 +32,12 @@ except (ValueError, ImportError):
 
 APP_ID = "quick-code"
 CONFIG_PATH = Path(GLib.get_user_config_dir()) / APP_ID / "config.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+RECENT_PATH = STATE_DIR / APP_ID / "recent.json"
+PINNED_PATH = STATE_DIR / APP_ID / "pinned.json"
+# Repos remembered as recently opened; the menu shows the first RECENT_IN_MENU.
+RECENT_KEEP = 50
+RECENT_IN_MENU = 10
 
 DEFAULT_CONFIG = {
     # Folders searched for repos; also editable from the tray menu.
@@ -42,6 +48,9 @@ DEFAULT_CONFIG = {
     "show_hidden": False,
     # How many folder levels below root to search for repos (1 = direct children only).
     "max_depth": 3,
+    # Up to this many repos are listed directly in the menu. With more, the menu shows
+    # recently opened ones plus "Search repos…", since tray menus cannot scroll.
+    "menu_limit": 20,
 }
 
 # First installed one wins when "terminal" is not configured.
@@ -74,6 +83,21 @@ def load_config():
 def save_config(config):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def load_paths(file):
+    try:
+        return [Path(p) for p in json.loads(file.read_text())]
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+
+
+def save_paths(file, paths):
+    try:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json.dumps([str(p) for p in paths], indent=2) + "\n")
+    except OSError as e:
+        print(f"{APP_ID}: cannot save {file}: {e}", file=sys.stderr)
 
 
 def display_path(path):
@@ -119,6 +143,12 @@ class QuickCode:
         self.terminal = config["terminal"] or detect_terminal()
         self.show_hidden = config["show_hidden"]
         self.max_depth = config["max_depth"]
+        self.menu_limit = config["menu_limit"]
+        self.recent = load_paths(RECENT_PATH)
+        self.pinned = load_paths(PINNED_PATH)
+        # (label, path) for every repo found by the last scan, sorted by label.
+        self.repos = []
+        self.search_window = None
         self.rebuild_pending = 0
         # Every plain folder the last scan walked through is watched, so repos
         # cloned into a group folder show up too.
@@ -166,22 +196,48 @@ class QuickCode:
         menu = Gtk.Menu()
 
         visited = set()
+        per_root = []
+        for root in self.roots:
+            repos = self.scan(root, self.max_depth, visited) if root.is_dir() else None
+            per_root.append((root, repos))
+        self.watch(visited)
+        self.repos = self.label_repos([r for _, repos in per_root for r in repos or []])
+        labels = {path: label for label, path in self.repos}
+
+        # Pinned repos head the menu in both layouts, in the order they were pinned.
+        pinned = [p for p in self.pinned if p in labels]
+        for path in pinned:
+            self.add_repo(menu, labels[path], path)
+
         if not self.roots:
             self.add_item(menu, "No folders yet: use Add folder…", None)
-        for i, root in enumerate(self.roots):
-            if len(self.roots) > 1:
-                if i:
+        elif len(self.repos) > self.menu_limit:
+            if pinned:
+                menu.append(Gtk.SeparatorMenuItem())
+            self.add_item(menu, "Search repos…", lambda _: self.show_search())
+            recent = [p for p in self.recent if p in labels and p not in pinned]
+            if recent:
+                menu.append(Gtk.SeparatorMenuItem())
+                for path in recent[:RECENT_IN_MENU]:
+                    self.add_repo(menu, labels[path], path)
+            for root, repos in per_root:
+                if repos is None:
+                    self.add_item(menu, f"Not found: {root}", None)
+        else:
+            for i, (root, repos) in enumerate(per_root):
+                if len(self.roots) > 1:
+                    if i or pinned:
+                        menu.append(Gtk.SeparatorMenuItem())
+                    self.add_item(menu, display_path(root), None)
+                if repos is None:
+                    self.add_item(menu, f"Not found: {root}", None)
+                elif not repos:
+                    self.add_item(menu, f"No git repos in {display_path(root)}", None)
+                elif pinned and len(self.roots) == 1:
                     menu.append(Gtk.SeparatorMenuItem())
-                self.add_item(menu, display_path(root), None)
-            if not root.is_dir():
-                self.add_item(menu, f"Not found: {root}", None)
-                continue
-            repos = self.scan(root, self.max_depth, visited)
-            if repos:
-                self.add_repos(menu, repos)
-            else:
-                self.add_item(menu, f"No git repos in {display_path(root)}", None)
-        self.watch(visited)
+                unpinned = [p for p in repos or [] if p not in pinned]
+                for path in sorted(unpinned, key=lambda p: labels[p].lower()):
+                    self.add_repo(menu, labels[path], path)
 
         menu.append(Gtk.SeparatorMenuItem())
         if len(self.roots) == 1:
@@ -235,28 +291,61 @@ class QuickCode:
             self.config["roots"] = [display_path(r) for r in self.roots]
             save_config(self.config)
 
-    def add_repos(self, menu, repos):
-        # One flat list: GNOME shows submenus inline, so nesting repos under their
-        # group folders made the menu change width as groups were opened.
+    @staticmethod
+    def label_repos(repos):
+        """Sorted (label, path) pairs; repos sharing a name get their parent folder."""
         names = [r.name for r in repos]
         labelled = [
             (f"{r.name} ({r.parent.name})" if names.count(r.name) > 1 else r.name, r)
             for r in repos
         ]
-        for label, repo in sorted(labelled, key=lambda lr: lr[0].lower()):
-            item = Gtk.MenuItem(label=label, use_underline=False)
-            item.set_submenu(self.project_menu(str(repo)))
-            menu.append(item)
+        return sorted(labelled, key=lambda lr: lr[0].lower())
 
-    def project_menu(self, directory):
+    def add_repo(self, menu, label, path):
+        # Flat, never nested under group folders: GNOME shows submenus inline, so
+        # nesting made the menu change width as groups were opened.
+        item = Gtk.MenuItem(label=label, use_underline=False)
+        item.set_submenu(self.project_menu(path))
+        menu.append(item)
+
+    def project_menu(self, path):
         sub = Gtk.Menu()
-        self.add_item(sub, "VS Code", lambda _: self.open_editor(directory))
+        self.add_item(sub, "VS Code", lambda _: self.open_repo(path, self.open_editor))
         self.add_item(
-            sub, "Terminal", lambda _: self.open_terminal(directory),
+            sub, "Terminal", lambda _: self.open_repo(path, self.open_terminal),
             sensitive=self.terminal is not None,
         )
-        self.add_item(sub, "Files", lambda _: self.open_files(directory))
+        self.add_item(sub, "Files", lambda _: self.open_repo(path, self.open_files))
+        sub.append(Gtk.SeparatorMenuItem())
+        if path in self.pinned:
+            self.add_item(sub, "Unpin", lambda _: self.toggle_pin(path))
+        else:
+            self.add_item(sub, "Pin to top", lambda _: self.toggle_pin(path))
         return sub
+
+    def toggle_pin(self, path):
+        if path in self.pinned:
+            self.pinned.remove(path)
+        else:
+            self.pinned.append(path)
+        save_paths(PINNED_PATH, self.pinned)
+        self.rebuild_menu()
+
+    def open_repo(self, path, opener):
+        opener(str(path))
+        self.recent = [path] + [p for p in self.recent if p != path]
+        del self.recent[RECENT_KEEP:]
+        save_paths(RECENT_PATH, self.recent)
+        self.rebuild_menu()
+
+    def show_search(self):
+        if self.search_window is None:
+            self.search_window = SearchWindow(self)
+            self.search_window.connect("destroy", self.on_search_closed)
+        self.search_window.present()
+
+    def on_search_closed(self, _window):
+        self.search_window = None
 
     @staticmethod
     def add_item(menu, label, callback, sensitive=True):
@@ -282,6 +371,139 @@ class QuickCode:
         if self.rebuild_pending:
             GLib.source_remove(self.rebuild_pending)
         self.rebuild_pending = GLib.timeout_add(300, self.rebuild_menu)
+
+
+class SearchWindow(Gtk.Window):
+    """Type-to-filter list of every repo. Enter opens the selected one in the editor."""
+
+    def __init__(self, app):
+        super().__init__(title="Quick Code")
+        self.app = app
+        self.set_default_size(520, 560)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_keep_above(True)
+        self.connect("key-press-event", self.on_key)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        self.add(box)
+
+        self.entry = Gtk.SearchEntry(placeholder_text="Search repos")
+        self.entry.connect("search-changed", self.on_search_changed)
+        self.entry.connect("activate", lambda _: self.open_selected(app.open_editor))
+        box.pack_start(self.entry, False, False, 0)
+
+        self.listbox = Gtk.ListBox(activate_on_single_click=True)
+        self.listbox.set_filter_func(self.matches)
+        self.listbox.connect(
+            "row-activated", lambda _, row: self.open_row(row, app.open_editor)
+        )
+        # Pinned first, then recently opened, then the rest alphabetically.
+        order = app.pinned + [p for p in app.recent if p not in app.pinned]
+        rank = {p: i for i, p in enumerate(order)}
+        for label, path in sorted(app.repos, key=lambda lp: rank.get(lp[1], len(rank))):
+            self.listbox.add(self.make_row(label, path))
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.add(self.listbox)
+        box.pack_start(scroller, True, True, 0)
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_markup(
+            "<small>Enter VS Code · Ctrl+T Terminal · Ctrl+O Files · Ctrl+P pin · Esc close"
+            "</small>"
+        )
+        hint.get_style_context().add_class("dim-label")
+        box.pack_start(hint, False, False, 0)
+
+        self.show_all()
+        self.select_first()
+
+    def make_row(self, label, path):
+        row = Gtk.ListBoxRow()
+        row.label, row.path = label, path
+        row.haystack = f"{label} {display_path(path)}".lower()
+        lines = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6)
+        name = Gtk.Label(label=label, xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        where = Gtk.Label(
+            label=display_path(path.parent), xalign=0, ellipsize=Pango.EllipsizeMode.END
+        )
+        where.get_style_context().add_class("dim-label")
+        lines.pack_start(name, False, False, 0)
+        lines.pack_start(where, False, False, 0)
+        pin = Gtk.Button(relief=Gtk.ReliefStyle.NONE, valign=Gtk.Align.CENTER)
+        pin.connect("clicked", lambda _: self.toggle_pin(row))
+        row.pin = pin
+        self.show_pin(row)
+        layout = Gtk.Box(spacing=6)
+        layout.pack_start(lines, True, True, 0)
+        layout.pack_start(pin, False, False, 0)
+        row.add(layout)
+        return row
+
+    def show_pin(self, row):
+        pinned = row.path in self.app.pinned
+        row.pin.set_image(Gtk.Image.new_from_icon_name(
+            "starred-symbolic" if pinned else "non-starred-symbolic", Gtk.IconSize.BUTTON
+        ))
+        row.pin.set_tooltip_text("Unpin" if pinned else "Pin to top of the menu")
+
+    def toggle_pin(self, row):
+        self.app.toggle_pin(row.path)
+        self.show_pin(row)
+
+    def matches(self, row):
+        return all(word in row.haystack for word in self.entry.get_text().lower().split())
+
+    def visible_rows(self):
+        return [row for row in self.listbox.get_children() if self.matches(row)]
+
+    def select_first(self):
+        rows = self.visible_rows()
+        self.listbox.select_row(rows[0] if rows else None)
+
+    def on_search_changed(self, _entry):
+        self.listbox.invalidate_filter()
+        self.select_first()
+
+    def move_selection(self, step):
+        rows = self.visible_rows()
+        if not rows:
+            return
+        current = self.listbox.get_selected_row()
+        i = rows.index(current) + step if current in rows else 0
+        row = rows[max(0, min(i, len(rows) - 1))]
+        self.listbox.select_row(row)
+        row.grab_focus()
+        self.entry.grab_focus_without_selecting()
+
+    def open_row(self, row, opener):
+        if opener is self.app.open_terminal and self.app.terminal is None:
+            return
+        self.app.open_repo(row.path, opener)
+        self.destroy()
+
+    def open_selected(self, opener):
+        row = self.listbox.get_selected_row()
+        if row is not None and self.matches(row):
+            self.open_row(row, opener)
+
+    def on_key(self, _widget, event):
+        key = Gdk.keyval_name(event.keyval)
+        ctrl = event.state & Gdk.ModifierType.CONTROL_MASK
+        if key == "Escape":
+            self.destroy()
+        elif key in ("Down", "Up"):
+            self.move_selection(1 if key == "Down" else -1)
+        elif ctrl and key in ("t", "T"):
+            self.open_selected(self.app.open_terminal)
+        elif ctrl and key in ("o", "O"):
+            self.open_selected(self.app.open_files)
+        elif ctrl and key in ("p", "P"):
+            row = self.listbox.get_selected_row()
+            if row is not None and self.matches(row):
+                self.toggle_pin(row)
+        else:
+            return False
+        return True
 
 
 def main():
