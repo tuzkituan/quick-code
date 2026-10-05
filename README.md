@@ -1,8 +1,12 @@
 # quick-code
 
-Tray icon that lists every folder in `~/projects` (configurable). Each entry has a submenu
-to open it in **VS Code**, a **Terminal**, or **Files**. The list updates live as folders
-are added or removed.
+Tray icon that lists every git repo under one or more folders (`~/projects` by default).
+Repos inside plain folders (e.g. `~/projects/group/repo`) appear under a submenu named after
+the folder; folders with no repos are hidden. Each repo has a submenu to open it in
+**VS Code**, a **Terminal**, or **Files**. The list updates live as repos are added or removed.
+
+Pick the folders from the tray with **Add folder…** and **Remove folder**, or list them in the
+config.
 
 ## Requirements
 
@@ -28,7 +32,8 @@ quick-code &            # start now (or log out and back in)
 ./install.sh --uninstall
 ```
 
-Or run directly without installing: `./quick_code.py [--root PATH]`.
+Or run directly without installing: `./quick_code.py [--root PATH]...` (`--root` is repeatable
+and overrides the configured folders for that run).
 
 ## Config
 
@@ -36,18 +41,21 @@ Or run directly without installing: `./quick_code.py [--root PATH]`.
 
 ```json
 {
-  "root": "~/projects",
+  "roots": ["~/projects"],
   "editor": ["code"],
   "terminal": null,
-  "show_hidden": false
+  "show_hidden": false,
+  "max_depth": 3
 }
 ```
 
 - `editor` / `terminal` are argv lists. `{dir}` is replaced with the folder path; if absent,
   the path is appended. Example: `"terminal": ["kitty", "--directory", "{dir}"]`.
+- `roots` are the folders searched for repos. An older single `"root"` entry is still read.
+- `max_depth` is how many folder levels below each root are searched for repos.
 - `terminal: null` auto-detects ptyxis, gnome-terminal, konsole, kitty, alacritty or xterm.
 
-Restart quick-code after editing the config.
+Restart quick-code after editing the config by hand (tray changes apply immediately).
 
 ## License
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""quick-code: tray menu listing the subdirectories of a folder, each openable
-in VS Code, a terminal, or the file manager."""
+"""quick-code: tray menu listing the git repositories under one or more folders,
+each openable in VS Code, a terminal, or the file manager."""
 
 import argparse
 import json
@@ -34,11 +34,14 @@ APP_ID = "quick-code"
 CONFIG_PATH = Path(GLib.get_user_config_dir()) / APP_ID / "config.json"
 
 DEFAULT_CONFIG = {
-    "root": "~/projects",
+    # Folders searched for repos; also editable from the tray menu.
+    "roots": ["~/projects"],
     "editor": ["code"],
     # null = auto-detect from TERMINALS below
     "terminal": None,
     "show_hidden": False,
+    # How many folder levels below root to search for repos (1 = direct children only).
+    "max_depth": 3,
 }
 
 # First installed one wins when "terminal" is not configured.
@@ -59,10 +62,23 @@ def load_config():
             config.update(json.loads(CONFIG_PATH.read_text()))
         except (OSError, json.JSONDecodeError) as e:
             print(f"{APP_ID}: ignoring bad config {CONFIG_PATH}: {e}", file=sys.stderr)
+        # Configs written before multi-root support have a single "root".
+        legacy = config.pop("root", None)
+        if legacy and config["roots"] == DEFAULT_CONFIG["roots"]:
+            config["roots"] = [legacy]
     else:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+        save_config(config)
     return config
+
+
+def save_config(config):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def display_path(path):
+    home = Path.home()
+    return f"~/{path.relative_to(home)}" if path.is_relative_to(home) else str(path)
 
 
 def detect_terminal():
@@ -94,12 +110,19 @@ def launch(cmd, cwd):
 
 
 class QuickCode:
-    def __init__(self, config):
-        self.root = Path(os.path.expanduser(config["root"])).resolve()
+    def __init__(self, config, persist=True):
+        self.config = config
+        # False when roots came from --root, so the menu never overwrites the saved ones.
+        self.persist = persist
+        self.roots = [Path(os.path.expanduser(r)).resolve() for r in config["roots"]]
         self.editor = config["editor"]
         self.terminal = config["terminal"] or detect_terminal()
         self.show_hidden = config["show_hidden"]
+        self.max_depth = config["max_depth"]
         self.rebuild_pending = 0
+        # Every plain folder the last scan walked through is watched, so repos
+        # cloned into a group folder show up too.
+        self.monitors = {}
 
         self.indicator = AppIndicator.Indicator.new(
             APP_ID, "folder-symbolic", AppIndicator.IndicatorCategory.APPLICATION_STATUS
@@ -107,48 +130,124 @@ class QuickCode:
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_title("Quick Code")
 
-        self.monitor = None
-        if self.root.is_dir():
-            self.monitor = Gio.File.new_for_path(str(self.root)).monitor_directory(
-                Gio.FileMonitorFlags.WATCH_MOVES, None
-            )
-            self.monitor.connect("changed", self.on_root_changed)
-
         self.rebuild_menu()
 
-    def list_projects(self):
+    def scan(self, directory, depth, visited):
+        """Return sorted (path, children) nodes under directory. children is None for
+        a repo, else the nodes of a plain folder that has repos somewhere below it.
+        Repos are not descended into, so nested node_modules etc. are never walked."""
+        visited.add(directory)
+        nodes = []
         try:
-            entries = [
-                p for p in self.root.iterdir()
-                if p.is_dir() and (self.show_hidden or not p.name.startswith("."))
-            ]
+            entries = list(directory.iterdir())
         except OSError:
-            return None
-        return sorted(entries, key=lambda p: p.name.lower())
+            return nodes
+        for p in entries:
+            if not p.is_dir() or (not self.show_hidden and p.name.startswith(".")):
+                continue
+            # .git is a file in worktrees and submodules, hence exists() not is_dir()
+            if (p / ".git").exists():
+                nodes.append((p, None))
+            elif depth > 1:
+                children = self.scan(p, depth - 1, visited)
+                if children:
+                    nodes.append((p, children))
+        return sorted(nodes, key=lambda n: n[0].name.lower())
+
+    def watch(self, directories):
+        for path in self.monitors.keys() - directories:
+            self.monitors.pop(path).cancel()
+        for path in directories - self.monitors.keys():
+            monitor = Gio.File.new_for_path(str(path)).monitor_directory(
+                Gio.FileMonitorFlags.WATCH_MOVES, None
+            )
+            monitor.connect("changed", self.on_root_changed)
+            self.monitors[path] = monitor
 
     def rebuild_menu(self):
         self.rebuild_pending = 0
         menu = Gtk.Menu()
 
-        projects = self.list_projects()
-        if projects is None:
-            self.add_item(menu, f"Root not found: {self.root}", None)
-        elif not projects:
-            self.add_item(menu, f"No folders in {self.root}", None)
-        else:
-            for project in projects:
-                item = Gtk.MenuItem(label=project.name, use_underline=False)
-                item.set_submenu(self.project_menu(str(project)))
-                menu.append(item)
+        visited = set()
+        if not self.roots:
+            self.add_item(menu, "No folders yet: use Add folder…", None)
+        for i, root in enumerate(self.roots):
+            if len(self.roots) > 1:
+                if i:
+                    menu.append(Gtk.SeparatorMenuItem())
+                self.add_item(menu, display_path(root), None)
+            if not root.is_dir():
+                self.add_item(menu, f"Not found: {root}", None)
+                continue
+            nodes = self.scan(root, self.max_depth, visited)
+            if nodes:
+                self.add_nodes(menu, nodes)
+            else:
+                self.add_item(menu, f"No git repos in {display_path(root)}", None)
+        self.watch(visited)
 
         menu.append(Gtk.SeparatorMenuItem())
-        self.add_item(menu, "Open root in Files", lambda _: self.open_files(str(self.root)))
+        if len(self.roots) == 1:
+            root = str(self.roots[0])
+            self.add_item(menu, "Open root in Files", lambda _: self.open_files(root))
+        elif self.roots:
+            menu.append(self.roots_submenu("Open root in Files", self.open_files))
+        self.add_item(menu, "Add folder…", lambda _: self.add_root())
+        if self.roots:
+            menu.append(self.roots_submenu("Remove folder", self.remove_root))
         self.add_item(menu, "Refresh", lambda _: self.rebuild_menu())
         self.add_item(menu, "Quit", lambda _: Gtk.main_quit())
 
         menu.show_all()
         self.indicator.set_menu(menu)
         return GLib.SOURCE_REMOVE
+
+    def roots_submenu(self, label, action):
+        item = Gtk.MenuItem(label=label, use_underline=False)
+        sub = Gtk.Menu()
+        for root in self.roots:
+            self.add_item(sub, display_path(root), lambda _, r=str(root): action(r))
+        item.set_submenu(sub)
+        return item
+
+    def add_root(self):
+        dialog = Gtk.FileChooserDialog(
+            title="Add a projects folder", action=Gtk.FileChooserAction.SELECT_FOLDER
+        )
+        dialog.add_buttons(
+            "_Cancel", Gtk.ResponseType.CANCEL, "_Add", Gtk.ResponseType.ACCEPT
+        )
+        dialog.set_select_multiple(True)
+        dialog.set_current_folder(str(Path.home()))
+        if dialog.run() == Gtk.ResponseType.ACCEPT:
+            for name in dialog.get_filenames():
+                path = Path(name).resolve()
+                if path not in self.roots:
+                    self.roots.append(path)
+            self.save_roots()
+        dialog.destroy()
+        self.rebuild_menu()
+
+    def remove_root(self, root):
+        self.roots.remove(Path(root))
+        self.save_roots()
+        self.rebuild_menu()
+
+    def save_roots(self):
+        if self.persist:
+            self.config["roots"] = [display_path(r) for r in self.roots]
+            save_config(self.config)
+
+    def add_nodes(self, menu, nodes):
+        for path, children in nodes:
+            item = Gtk.MenuItem(label=path.name, use_underline=False)
+            if children is None:
+                item.set_submenu(self.project_menu(str(path)))
+            else:
+                sub = Gtk.Menu()
+                self.add_nodes(sub, children)
+                item.set_submenu(sub)
+            menu.append(item)
 
     def project_menu(self, directory):
         sub = Gtk.Menu()
@@ -188,19 +287,22 @@ class QuickCode:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", help="folder whose subdirectories are listed")
+    parser.add_argument(
+        "--root", action="append",
+        help="folder to search for repos (repeatable; overrides the configured roots)",
+    )
     args = parser.parse_args()
 
     config = load_config()
     if args.root:
-        config["root"] = args.root
+        config["roots"] = args.root
 
     # Launched apps are never waited on; let the kernel reap them.
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     for sig in (signal.SIGINT, signal.SIGTERM):
         unix_signal_add(GLib.PRIORITY_DEFAULT, sig, Gtk.main_quit)
 
-    QuickCode(config)
+    QuickCode(config, persist=not args.root)
     Gtk.main()
 
 
